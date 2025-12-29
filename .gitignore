@@ -1,0 +1,46 @@
+# Vivado Project Files
+*.jou
+*.log
+*.str
+*.xpr
+*.bit
+*.bin
+*.ltx
+
+# Vivado Generated Directories
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.srcs/
+*_behav/
+*_synth/
+
+# Simulation Output
+*.vcd
+*.wdb
+*.wcfg
+
+# Compiled Files
+*.o
+*.obj
+
+# Backup Files
+*~
+*.bak
+*.orig
+
+# OS Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE Files
+.vscode/
+*.code-workspace
+
+# Temporary Files
+*.tmp
+*.temp
