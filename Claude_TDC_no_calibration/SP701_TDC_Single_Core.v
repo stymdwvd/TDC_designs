@@ -1,19 +1,78 @@
 /**
  * ================================================================
  * SP701 Single-Channel TDC Core - NO CALIBRATION VERSION
- * Date: 2025-12-28
- * Description: Simplified TDC without calibration system
+ * Target: Xilinx Spartan-7 XC7S100 (SP701 Evaluation Board)
+ * Clock:  100 MHz (10ns period)
+ * Accuracy: ~50-100ps (linear approximation, no calibration)
+ * ================================================================
  *
- * This version uses LINEAR APPROXIMATION for fine time calculation:
- *   fine_time_ps = tap_position × (clock_period_ps / num_taps)
+ * BLOCK DIAGRAM:
  *
- * ACCURACY: ~50-100ps (vs ~10-20ps with calibration)
- * RESOURCES: Reduced (no calibration LUTs, simpler logic)
+ *  From Top Module          Core Module
+ *  +-----------+    +--------------------------------------------------+
+ *  | tdc_start |--->|  4-stage       Edge Detect    2-cycle delay       |
+ *  | tdc_stop  |--->|  sync regs --> (d3 & ~d4) --> compensation ----+  |
+ *  |           |    |                                                |  |
+ *  | clk       |--->|  Coarse Counter (32-bit free-running)         |  |
+ *  | rst_n     |--->|       |                                       |  |
+ *  |           |    |       v                                       v  |
+ *  | tdc_enable|--->|  STATE MACHINE --------------------------------  |
+ *  | tdc_reset |--->|  IDLE -> WAIT_START -> MEASURING -> PROC 1-3     |
+ *  | cont_mode |--->|       |                    |           |         |
+ *  |           |    |       |   start_edge:      |  stop_edge:         |
+ *  |           |    |       |   capture coarse    |  capture coarse    |
+ *  |           |    |       |   + fine tap        |  + fine tap        |
+ *  |           |    |       |                    |           |         |
+ *  |           |    |       |              PROCESSING PIPELINE         |
+ *  |           |    |       |              Stage1: coarse_diff,        |
+ *  |           |    |       |                      fine_diff           |
+ *  |           |    |       |              Stage2: coarse×period_ps,   |
+ *  |           |    |       |                      fine×period_ps      |
+ *  |           |    |       |              Stage3: total_ps output     |
+ *  +-----------+    |       |                          |               |
+ *                   |       v                          v               |
+ *  +-----------+    |  time_interval (32-bit ps)                       |
+ *  | Outputs   |<---|  time_interval_ps (16-bit sub-ns)                |
+ *  | to Top    |<---|  measurement_valid, measurement_ready            |
+ *  | Module    |<---|  tdc_busy, timeout_error, overflow_error         |
+ *  +-----------+    +--------------------------------------------------+
+ *                         |
+ *  +-----------+          |  Delay Line Instance
+ *  | DelayLine |<-------->|  (CARRY4 chain + bubble suppression
+ *  | Module    |          |   + tree encoder, 4-stage pipeline)
+ *  +-----------+          |  Returns: encoded_start/stop [7:0]
  *
- * MEASUREMENT PRINCIPLE:
- * - Delay line captures signal position on EVERY rising clock edge
- * - Coarse counter increments on rising clock edge
- * - Fine time = tap position × linear tap delay estimate
+ * DATA FLOW (per measurement):
+ *
+ * 1. IDLE: Wait for tdc_enable. Clear errors on tdc_reset.
+ *
+ * 2. WAIT_START: Wait for start_edge (rising edge on tdc_start).
+ *    On start_edge: latch coarse_counter → start_coarse_time
+ *                   latch encoded_start  → start_fine_time
+ *    Note: start_edge is delayed 2 cycles from raw edge detection
+ *          to align with the 2-stage delay line pipeline.
+ *
+ * 3. MEASURING: Wait for stop_edge (rising edge on tdc_stop).
+ *    On stop_edge: latch coarse_counter → stop_coarse_time
+ *                  latch encoded_stop   → stop_fine_time
+ *
+ * 4. PROC_STAGE1: Compute differences
+ *    coarse_diff = stop_coarse - start_coarse
+ *    fine_diff   = stop_fine - start_fine  (with boundary correction)
+ *
+ * 5. PROC_STAGE2: Convert to picoseconds (fixed-point)
+ *    coarse_ps = coarse_diff × CLOCK_PERIOD_PS
+ *    fine_product = fine_diff × CLOCK_PERIOD_PS  (keep full precision)
+ *
+ * 6. PROC_STAGE3: Final result
+ *    time_interval = coarse_ps + (fine_product >>> 8)
+ *    Assert measurement_valid and measurement_ready
+ *
+ * FINE TIME CALCULATION (fixed-point, no truncation):
+ *   fine_ps = (tap_diff × 10000) >>> 8
+ *   This is equivalent to tap_diff × 39.0625 ps/tap
+ *   (vs integer 39 ps/tap which loses 0.0625/tap)
+ *
  * ================================================================
  */
 
@@ -22,8 +81,7 @@ module sp701_tdc_single_core #(
     parameter CLOCK_PERIOD_PS = 10000,          // 10ns = 10000ps
     parameter MAX_TIME_INTERVAL_NS = 1000000,   // 1ms maximum interval
     parameter DELAY_LINE_TAPS = 256,            // Number of delay line taps
-    parameter DATA_WIDTH = 32,                  // Output data width
-    parameter ADDR_WIDTH = 8                    // Address width for registers
+    parameter DATA_WIDTH = 32                   // Output data width
 ) (
     // Clock and Reset
     input  wire clk,                    // System clock (100 MHz)
@@ -36,15 +94,7 @@ module sp701_tdc_single_core #(
     // Control Interface
     input  wire tdc_enable,             // Enable TDC operation
     input  wire tdc_reset,              // Reset TDC measurement
-    input  wire [2:0] edge_select,      // Edge detection selection
     input  wire continuous_mode,        // Continuous measurement mode
-
-    // Configuration Registers Interface
-    input  wire [ADDR_WIDTH-1:0] reg_addr,
-    input  wire [DATA_WIDTH-1:0] reg_wdata,
-    input  wire reg_write,
-    input  wire reg_read,
-    output reg  [DATA_WIDTH-1:0] reg_rdata,
 
     // TDC Output
     output reg  [DATA_WIDTH-1:0] time_interval,    // Measured time interval (ps)
@@ -66,11 +116,11 @@ module sp701_tdc_single_core #(
 // ----------------------------------------------------------------
 // Linear Tap Delay Calculation (No Calibration)
 // ----------------------------------------------------------------
-// Assumes uniform tap delays across the delay line
-// tap_delay = clock_period / num_taps
-// For 100MHz (10ns) with 256 taps: ~39ps per tap
+// Fine time = (tap_diff × CLOCK_PERIOD_PS) / DELAY_LINE_TAPS
+// Since DELAY_LINE_TAPS is a power of 2, division becomes a right shift
+// This avoids the truncation error of integer TAP_DELAY_PS (39 vs 39.0625)
 
-localparam TAP_DELAY_PS = CLOCK_PERIOD_PS / DELAY_LINE_TAPS;  // ~39ps
+localparam TAPS_SHIFT = $clog2(DELAY_LINE_TAPS);  // = 8 for 256 taps
 
 // ----------------------------------------------------------------
 // State Machine States
@@ -91,7 +141,7 @@ reg [3:0] tdc_state, tdc_state_next;
 // Input Edge Detection with Metastability Protection
 // ----------------------------------------------------------------
 // 4-stage synchronizer for asynchronous input signals
-// Default mode: Rising edge detection (edge_select[0] = 1)
+// Rising edge detection only
 
 wire start_edge, stop_edge;
 (* ASYNC_REG = "TRUE" *) reg start_edge_d1, start_edge_d2;
@@ -99,14 +149,19 @@ reg start_edge_d3, start_edge_d4;
 (* ASYNC_REG = "TRUE" *) reg stop_edge_d1, stop_edge_d2;
 reg stop_edge_d3, stop_edge_d4;
 
-// Edge detection on synchronized signals
-assign start_edge = (edge_select[0]) ? (start_edge_d3 & ~start_edge_d4) :  // Rising edge
-                   (edge_select[1]) ? (~start_edge_d3 & start_edge_d4) :   // Falling edge
-                                     (start_edge_d3 ^ start_edge_d4);      // Both edges
+// Pipeline delay compensation registers
+// The delay line module adds 2 extra pipeline stages (bubble reg + encoder reg)
+// so edge detection must be delayed by 2 cycles to align with encoded tap values
+reg start_edge_raw, stop_edge_raw;
+reg start_edge_delay1, stop_edge_delay1;
 
-assign stop_edge = (edge_select[0]) ? (stop_edge_d3 & ~stop_edge_d4) :    // Rising edge
-                  (edge_select[1]) ? (~stop_edge_d3 & stop_edge_d4) :     // Falling edge
-                                    (stop_edge_d3 ^ stop_edge_d4);        // Both edges
+// Raw edge detection on synchronized signals
+wire start_edge_raw_w = start_edge_d3 & ~start_edge_d4;
+wire stop_edge_raw_w = stop_edge_d3 & ~stop_edge_d4;
+
+// Delayed edge detection (2 cycles to match delay line pipeline)
+assign start_edge = start_edge_delay1;
+assign stop_edge = stop_edge_delay1;
 
 // ----------------------------------------------------------------
 // Internal Registers
@@ -125,8 +180,7 @@ reg  [31:0] coarse_diff_stage1;
 reg  signed [16:0] fine_diff_stage1;
 reg  boundary_crossing_stage1;
 reg  [31:0] coarse_ps_stage2;
-reg  signed [16:0] fine_ps_stage2;
-reg  [31:0] total_time_stage3;
+reg  signed [31:0] fine_product_stage2;  // fine_diff × CLOCK_PERIOD_PS (full precision)
 
 // Delay Line Signals
 wire [DELAY_LINE_TAPS-1:0] delay_line_start_taps;
@@ -134,10 +188,6 @@ wire [DELAY_LINE_TAPS-1:0] delay_line_stop_taps;
 wire [7:0] start_tap_encoded;
 wire [7:0] stop_tap_encoded;
 wire start_valid, stop_valid;
-
-// Configuration Registers
-reg  [31:0] config_reg [7:0];
-integer j;
 
 // Timeout Detection
 localparam TIMEOUT_CYCLES = CLOCK_FREQ_HZ / 1000; // 1ms timeout
@@ -161,6 +211,11 @@ always @(posedge clk or negedge rst_n) begin
         stop_edge_d2 <= 1'b0;
         stop_edge_d3 <= 1'b0;
         stop_edge_d4 <= 1'b0;
+        // Pipeline delay compensation
+        start_edge_raw <= 1'b0;
+        stop_edge_raw <= 1'b0;
+        start_edge_delay1 <= 1'b0;
+        stop_edge_delay1 <= 1'b0;
     end else begin
         start_edge_d1 <= tdc_start;
         start_edge_d2 <= start_edge_d1;
@@ -170,6 +225,11 @@ always @(posedge clk or negedge rst_n) begin
         stop_edge_d2 <= stop_edge_d1;
         stop_edge_d3 <= stop_edge_d2;
         stop_edge_d4 <= stop_edge_d3;
+        // 2-cycle delay to align edge detection with encoder output
+        start_edge_raw <= start_edge_raw_w;
+        stop_edge_raw <= stop_edge_raw_w;
+        start_edge_delay1 <= start_edge_raw;
+        stop_edge_delay1 <= stop_edge_raw;
     end
 end
 
@@ -265,8 +325,7 @@ always @(posedge clk or negedge rst_n) begin
         fine_diff_stage1 <= 17'sb0;
         boundary_crossing_stage1 <= 1'b0;
         coarse_ps_stage2 <= 32'b0;
-        fine_ps_stage2 <= 17'sb0;
-        total_time_stage3 <= 32'b0;
+        fine_product_stage2 <= 32'sb0;
     end else begin
         // Default values
         measurement_ready <= 1'b0;
@@ -317,7 +376,7 @@ always @(posedge clk or negedge rst_n) begin
                 end
             end
 
-            // Pipeline Stage 2: Convert to picoseconds (LINEAR APPROXIMATION)
+            // Pipeline Stage 2: Convert to picoseconds (FIXED-POINT)
             PROC_STAGE2: begin
                 // Adjust coarse count if boundary crossing occurred
                 if (boundary_crossing_stage1) begin
@@ -326,8 +385,9 @@ always @(posedge clk or negedge rst_n) begin
                     coarse_ps_stage2 <= coarse_diff_stage1 * CLOCK_PERIOD_PS;
                 end
 
-                // Linear approximation: fine_ps = tap_diff × tap_delay
-                fine_ps_stage2 <= (fine_diff_stage1 * $signed(TAP_DELAY_PS));
+                // Full precision: fine_ps = (tap_diff × CLOCK_PERIOD_PS) >> TAPS_SHIFT
+                // Keeps full product before shifting, avoids truncation error
+                fine_product_stage2 <= fine_diff_stage1 * $signed({1'b0, CLOCK_PERIOD_PS[15:0]});
             end
 
             // Pipeline Stage 3: Final calculation
@@ -336,14 +396,15 @@ always @(posedge clk or negedge rst_n) begin
                     overflow_error <= 1'b1;
                     measurement_valid <= 1'b0;
                 end else begin
-                    if (fine_ps_stage2 >= 0) begin
-                        total_time_stage3 <= coarse_ps_stage2 + fine_ps_stage2[15:0];
+                    // Arithmetic right shift: divide product by DELAY_LINE_TAPS
+                    // fine_ps_shifted = (fine_diff × CLOCK_PERIOD_PS) / 256
+                    if (fine_product_stage2 >= 0) begin
+                        time_interval <= coarse_ps_stage2 + (fine_product_stage2 >>> TAPS_SHIFT);
+                        time_interval_ps <= fine_product_stage2[TAPS_SHIFT +: 16];
                     end else begin
-                        total_time_stage3 <= coarse_ps_stage2;
+                        time_interval <= coarse_ps_stage2;
+                        time_interval_ps <= 16'b0;
                     end
-
-                    time_interval <= coarse_ps_stage2 + (fine_ps_stage2 >= 0 ? fine_ps_stage2[15:0] : 16'b0);
-                    time_interval_ps <= fine_ps_stage2[15:0];
                     measurement_valid <= 1'b1;
                     measurement_ready <= 1'b1;
                 end
@@ -361,39 +422,6 @@ always @(posedge clk or negedge rst_n) begin
                 measurement_valid <= 1'b0;
             end
         endcase
-    end
-end
-
-// ----------------------------------------------------------------
-// Configuration Register Interface
-// ----------------------------------------------------------------
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        for (j = 0; j < 8; j = j + 1) begin
-            config_reg[j] <= 32'b0;
-        end
-        config_reg[0] <= 32'h00000001;  // TDC enable
-        config_reg[1] <= 32'h00000001;  // Edge select (rising)
-        reg_rdata <= 32'b0;
-    end else begin
-        if (reg_write && reg_addr < 8) begin
-            config_reg[reg_addr] <= reg_wdata;
-        end
-
-        if (reg_read) begin
-            case (reg_addr)
-                8'h00: reg_rdata <= config_reg[0];
-                8'h01: reg_rdata <= config_reg[1];
-                8'h10: reg_rdata <= time_interval;
-                8'h11: reg_rdata <= {16'b0, time_interval_ps};
-                8'h12: reg_rdata <= {24'b0, delay_line_code};
-                8'h13: reg_rdata <= coarse_counter;
-                8'h20: reg_rdata <= {28'b0, tdc_state};
-                8'h21: reg_rdata <= {30'b0, timeout_error, overflow_error};
-                default: reg_rdata <= 32'b0;
-            endcase
-        end
     end
 end
 

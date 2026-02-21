@@ -36,7 +36,6 @@ reg tdc_stop;
 // Control Interface
 reg tdc_enable;
 reg tdc_arm;
-reg [1:0] edge_mode;
 
 // Status LEDs
 wire led_tdc_ready;
@@ -81,7 +80,6 @@ sp701_tdc_single_top #(
     // Control
     .tdc_enable(tdc_enable),
     .tdc_arm(tdc_arm),
-    .edge_mode(edge_mode),
 
     // Status LEDs
     .led_tdc_ready(led_tdc_ready),
@@ -103,7 +101,6 @@ task reset_system;
         tdc_stop = 0;
         tdc_enable = 0;
         tdc_arm = 0;
-        edge_mode = 2'b00;  // Rising edge (DEFAULT)
 
         repeat(20) @(posedge sys_clk_p);
         sys_rst_n = 1;

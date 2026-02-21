@@ -1,18 +1,41 @@
 /**
  * ================================================================
  * SP701 Single-Channel TDC Top Level - NO CALIBRATION VERSION
- * Date: 2025-12-28
- * Description: Simplified TDC without calibration, ILA for debug
+ * Target: Xilinx Spartan-7 XC7S100 (SP701 Evaluation Board)
+ * Clock:  100 MHz (10ns period)
+ * Accuracy: ~50-100ps (linear approximation, no calibration)
+ * ================================================================
  *
- * This version uses LINEAR APPROXIMATION - no external reference
- * clock needed for calibration.
+ * SYSTEM BLOCK DIAGRAM:
  *
- * ACCURACY: ~50-100ps (sufficient for many applications)
- * ADVANTAGES:
- * - No calibration reference clock required
- * - Simpler interface
- * - Reduced resource usage
- * - Faster startup (no calibration delay)
+ *   External Pins            Top Module                     Core Module
+ *  +-----------+    +---------------------------+    +------------------+
+ *  | sys_clk_p |--->| IBUF -> BUFG (sys_clk)    |--->| clk              |
+ *  | sys_rst_n |--->| 4-stage reset sync        |--->| rst_n            |
+ *  |           |    |                           |    |                  |
+ *  | tdc_start |----+--- (direct to core) ------+--->| tdc_start        |
+ *  | tdc_stop  |----+--- (direct to core) ------+--->| tdc_stop         |
+ *  |           |    |                           |    |                  |
+ *  | tdc_enable|--->| 2-stage sync -> enable    |--->| tdc_enable       |
+ *  | tdc_arm   |--->| 2-stage sync -> reset     |--->| tdc_reset        |
+ *  +-----------+    |                           |    |                  |
+ *                   |   Result Storage           |<---| time_interval    |
+ *  +-----------+    |   (last_time_interval,     |<---| measurement_ready|
+ *  | LEDs      |<---|    last_fine_time,         |<---| measurement_valid|
+ *  | ready     |<---|    last_tap_code,          |<---| tdc_busy         |
+ *  | measuring |<---|    measurement_count)      |<---| timeout_error    |
+ *  | valid     |<---|                           |<---| overflow_error   |
+ *  | error     |<---|   ILA Debug Bus [95:0]     |    +------------------+
+ *  +-----------+    +---------------------------+
+ *
+ * SIGNAL FLOW:
+ * 1. sys_clk_p  -> IBUF -> BUFG -> sys_clk (all logic runs on this)
+ * 2. sys_rst_n  -> 4-stage sync -> rst_sync_n (safe async reset release)
+ * 3. tdc_enable -> 2-stage sync -> tdc_enable_sync (metastability safe)
+ * 4. tdc_arm    -> 2-stage sync -> tdc_arm_sync -> tdc_reset
+ * 5. tdc_start/stop go directly to Core (Core has its own 4-stage sync)
+ * 6. Measurements captured via ILA debug probes (no external data bus)
+ *
  * ================================================================
  */
 
@@ -32,7 +55,6 @@ module sp701_tdc_single_top #(
     // Simple Control Interface
     input  wire tdc_enable,             // Enable TDC operation
     input  wire tdc_arm,                // Arm for next measurement
-    input  wire [1:0] edge_mode,        // 00=rising, 01=falling, 10=both
 
     // Status LEDs
     output wire led_tdc_ready,          // TDC ready indicator
@@ -49,8 +71,9 @@ module sp701_tdc_single_top #(
 wire sys_clk;
 wire rst_sync_n;
 
-// TDC Control Signals
-wire [2:0] edge_select;
+// TDC Control Signals (synchronized)
+wire tdc_enable_sync;
+wire tdc_arm_sync;
 wire continuous_mode;
 wire tdc_reset;
 
@@ -114,19 +137,35 @@ end
 assign rst_sync_n = reset_sync_reg[3];
 
 // ----------------------------------------------------------------
+// Input Synchronizers for Control Signals
+// ----------------------------------------------------------------
+// 2-stage synchronizers to prevent metastability
+
+(* ASYNC_REG = "TRUE" *) reg [1:0] enable_sync_reg;
+(* ASYNC_REG = "TRUE" *) reg [1:0] arm_sync_reg;
+
+always @(posedge sys_clk or negedge rst_sync_n) begin
+    if (!rst_sync_n) begin
+        enable_sync_reg <= 2'b0;
+        arm_sync_reg <= 2'b0;
+    end else begin
+        enable_sync_reg <= {enable_sync_reg[0], tdc_enable};
+        arm_sync_reg <= {arm_sync_reg[0], tdc_arm};
+    end
+end
+
+assign tdc_enable_sync = enable_sync_reg[1];
+assign tdc_arm_sync = arm_sync_reg[1];
+
+// ----------------------------------------------------------------
 // Control Signal Mapping
 // ----------------------------------------------------------------
-
-// Edge selection: 00=rising (default), 01=falling, 10=both
-assign edge_select = (edge_mode == 2'b00) ? 3'b001 :  // Rising edge (DEFAULT)
-                     (edge_mode == 2'b01) ? 3'b010 :  // Falling edge
-                                            3'b100;   // Both edges
 
 // Continuous mode disabled for ILA capture
 assign continuous_mode = 1'b0;
 
-// TDC reset from arm signal
-assign tdc_reset = tdc_arm;
+// TDC reset from arm signal (synchronized)
+assign tdc_reset = tdc_arm_sync;
 
 // Monitor input signals
 assign tdc_start_mon = tdc_start;
@@ -156,18 +195,6 @@ end
 // TDC Core Instantiation (No Calibration)
 // ----------------------------------------------------------------
 
-wire [7:0]  reg_addr;
-wire [31:0] reg_wdata;
-wire [31:0] reg_rdata;
-wire        reg_write;
-wire        reg_read;
-
-// Tie off register interface
-assign reg_addr = 8'b0;
-assign reg_wdata = 32'b0;
-assign reg_write = 1'b0;
-assign reg_read = 1'b0;
-
 sp701_tdc_single_core #(
     .CLOCK_FREQ_HZ(CLOCK_FREQ_HZ),
     .CLOCK_PERIOD_PS(CLOCK_PERIOD_PS),
@@ -181,17 +208,9 @@ sp701_tdc_single_core #(
     .tdc_stop(tdc_stop),
 
     // Control
-    .tdc_enable(tdc_enable),
+    .tdc_enable(tdc_enable_sync),
     .tdc_reset(tdc_reset),
-    .edge_select(edge_select),
     .continuous_mode(continuous_mode),
-
-    // Register Interface (unused)
-    .reg_addr(reg_addr),
-    .reg_wdata(reg_wdata),
-    .reg_write(reg_write),
-    .reg_read(reg_read),
-    .reg_rdata(reg_rdata),
 
     // Outputs
     .time_interval(time_interval),
@@ -249,10 +268,10 @@ assign ila_data_bus = {
 
     // [15:8] - Status Flags (8 bits)
     {measurement_valid, measurement_ready, tdc_busy, 1'b0,
-     timeout_error, overflow_error, tdc_enable, rst_sync_n},
+     timeout_error, overflow_error, tdc_enable_sync, rst_sync_n},
 
     // [7:0] - Control Inputs (8 bits)
-    {edge_select, continuous_mode, 1'b0,
+    {3'b001, continuous_mode, 1'b0,
      tdc_start, tdc_stop, tdc_arm}
 };
 

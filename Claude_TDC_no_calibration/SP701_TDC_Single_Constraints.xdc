@@ -21,6 +21,9 @@ create_clock -period 10.000 -name sys_clk [get_ports sys_clk_p]
 set_property PACKAGE_PIN R2 [get_ports sys_clk_p]
 set_property IOSTANDARD LVCMOS33 [get_ports sys_clk_p]
 
+# Allow non-dedicated clock routing (R2 is not a CCIO pin)
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets sys_clk_ibuf_out]
+
 # ----------------------------------------------------------------
 # Reset
 # ----------------------------------------------------------------
@@ -35,12 +38,10 @@ set_property IOSTANDARD LVCMOS33 [get_ports sys_rst_n]
 # Start Signal (high-speed input)
 set_property PACKAGE_PIN M1 [get_ports tdc_start]
 set_property IOSTANDARD LVCMOS33 [get_ports tdc_start]
-set_property SLEW FAST [get_ports tdc_start]
 
 # Stop Signal (high-speed input)
 set_property PACKAGE_PIN N1 [get_ports tdc_stop]
 set_property IOSTANDARD LVCMOS33 [get_ports tdc_stop]
-set_property SLEW FAST [get_ports tdc_stop]
 
 # ----------------------------------------------------------------
 # Control Signals
@@ -54,19 +55,15 @@ set_property IOSTANDARD LVCMOS33 [get_ports tdc_enable]
 set_property PACKAGE_PIN R1 [get_ports tdc_arm]
 set_property IOSTANDARD LVCMOS33 [get_ports tdc_arm]
 
-# Edge Mode [1:0]
-set_property PACKAGE_PIN L2 [get_ports {edge_mode[0]}]
-set_property PACKAGE_PIN M2 [get_ports {edge_mode[1]}]
-set_property IOSTANDARD LVCMOS33 [get_ports {edge_mode[*]}]
-
 # ----------------------------------------------------------------
 # Status LEDs
 # ----------------------------------------------------------------
 
-set_property PACKAGE_PIN E13 [get_ports led_tdc_ready]
-set_property PACKAGE_PIN C13 [get_ports led_measuring]
-set_property PACKAGE_PIN B13 [get_ports led_data_valid]
-set_property PACKAGE_PIN A13 [get_ports led_error]
+# SP701 GPIO LEDs (Bank 15, active high)
+set_property PACKAGE_PIN J25 [get_ports led_tdc_ready]
+set_property PACKAGE_PIN M24 [get_ports led_measuring]
+set_property PACKAGE_PIN L24 [get_ports led_data_valid]
+set_property PACKAGE_PIN K25 [get_ports led_error]
 set_property IOSTANDARD LVCMOS33 [get_ports led_*]
 set_property SLEW SLOW [get_ports led_*]
 set_property DRIVE 8 [get_ports led_*]
@@ -75,18 +72,16 @@ set_property DRIVE 8 [get_ports led_*]
 # Timing Constraints
 # ----------------------------------------------------------------
 
-# Input delay for TDC signals (minimize for accuracy)
-set_input_delay -clock sys_clk -min 0.0 [get_ports tdc_start]
-set_input_delay -clock sys_clk -max 1.0 [get_ports tdc_start]
-set_input_delay -clock sys_clk -min 0.0 [get_ports tdc_stop]
-set_input_delay -clock sys_clk -max 1.0 [get_ports tdc_stop]
+# TDC start/stop are asynchronous inputs (handled by synchronizers)
+set_false_path -from [get_ports tdc_start]
+set_false_path -from [get_ports tdc_stop]
 
-# False paths for asynchronous inputs (handled by synchronizers)
-set_false_path -from [get_ports tdc_start] -to [get_pins -hierarchical *_d1_reg/D]
-set_false_path -from [get_ports tdc_stop] -to [get_pins -hierarchical *_d1_reg/D]
-
-# False path for reset
+# Reset is asynchronous (handled by reset synchronizer)
 set_false_path -from [get_ports sys_rst_n]
+
+# Control inputs are asynchronous (handled by synchronizers)
+set_false_path -from [get_ports tdc_enable]
+set_false_path -from [get_ports tdc_arm]
 
 # ----------------------------------------------------------------
 # Delay Line Constraints
